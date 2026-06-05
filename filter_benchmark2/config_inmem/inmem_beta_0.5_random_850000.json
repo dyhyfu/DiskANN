@@ -1,0 +1,42 @@
+{
+  "search_directories": [
+    "enron_filter_benchmark2/output",
+    "filter_benchmark2"
+  ],
+  "jobs": [
+    {
+      "content": {
+        "source": {
+          "index-source": "Load",
+          "data_type": "float16",
+          "distance": "squared_l2",
+          "load_path": "index_output2"
+        },
+        "search_phase": {
+          "search-type": "topk-beta-filter",
+          "queries": "query_vector_normalized_dim_384_fp16_top_1000.bin",
+          "groundtruth": "random_850000_groundtruth_filtered.bin",
+          "query_predicates": "random_850000_query.label.jsonl",
+          "data_labels": "data.label.jsonl",
+          "reps": 3,
+          "num_threads": [
+            12
+          ],
+          "runs": [
+            {
+              "search_n": 1000,
+              "search_l": [
+                1000,
+                2000,
+                3000
+              ],
+              "recall_k": 1000
+            }
+          ],
+          "beta": 0.5
+        }
+      },
+      "type": "graph-index-build"
+    }
+  ]
+}

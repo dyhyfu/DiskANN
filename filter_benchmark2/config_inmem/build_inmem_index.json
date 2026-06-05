@@ -1,0 +1,47 @@
+{
+  "search_directories": [
+    "enron_filter_benchmark2/output",
+    "filter_benchmark2"
+  ],
+  "output_directory": "filter_benchmark2",
+  "jobs": [
+    {
+      "content": {
+        "source": {
+          "index-source": "Build",
+          "data_type": "float16",
+          "data": "normalized_dim_384_vector_fp16_1087932_vectors.bin",
+          "distance": "squared_l2",
+          "max_degree": 59,
+          "l_build": 80,
+          "alpha": 1.2,
+          "backedge_ratio": 1.0,
+          "num_threads": 12,
+          "start_point_strategy": "medoid",
+          "save_path": "index_output2"
+        },
+        "search_phase": {
+          "search-type": "topk-adaptive-l-filter",
+          "queries": "query_vector_normalized_dim_384_fp16_top_1000.bin",
+          "groundtruth": "random_1000_groundtruth_filtered.bin",
+          "query_predicates": "random_1000_query.label.jsonl",
+          "data_labels": "data.label.jsonl",
+          "reps": 1,
+          "num_threads": [
+            12
+          ],
+          "runs": [
+            {
+              "search_n": 1000,
+              "search_l": [
+                2000
+              ],
+              "recall_k": 1000
+            }
+          ]
+        }
+      },
+      "type": "graph-index-build"
+    }
+  ]
+}

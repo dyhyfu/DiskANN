@@ -1,0 +1,45 @@
+{
+  "search_directories": [
+    "enron_filter_benchmark2/output",
+    "filter_benchmark2"
+  ],
+  "jobs": [
+    {
+      "type": "disk-index-filter",
+      "content": {
+        "source": {
+          "disk-index-source": "Build",
+          "data_type": "float16",
+          "data": "normalized_dim_384_vector_fp16_1087932_vectors.bin",
+          "distance": "squared_l2",
+          "dim": 384,
+          "max_degree": 59,
+          "l_build": 80,
+          "num_threads": 12,
+          "build_ram_limit_gb": 8.0,
+          "num_pq_chunks": 192,
+          "quantization_type": "SQ_1",
+          "save_path": "filter_benchmark2/disk_index_enron"
+        },
+        "search_phase": {
+          "queries": "query_vector_normalized_dim_384_fp16_top_1000.bin",
+          "groundtruth": "random_100_groundtruth_filtered.bin",
+          "data_labels": "data.label.jsonl",
+          "query_predicates": "random_100_query.label.jsonl",
+          "search_list": [
+            1000,
+            2000,
+            3000
+          ],
+          "beam_width": 4,
+          "recall_at": 1000,
+          "num_threads": 12,
+          "distance": "squared_l2",
+          "filter_type": {
+            "type": "AdaptiveLGreedy"
+          }
+        }
+      }
+    }
+  ]
+}

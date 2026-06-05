@@ -97,6 +97,72 @@ pub(crate) fn generate_bitmaps(
     Ok(bit_maps)
 }
 
+/// Fast bitmap generation for predicates that contain only `{"vector_id": {"$eq": "N"}}` leaves.
+///
+/// Scans each line for the literal pattern `"$eq":"N"` (or `"$eq": "N"` with spaces) and
+/// parses N directly, bypassing full JSON parsing entirely. This is O(line_length) per query
+/// line instead of O(total_vectors) for the old inverted-index approach.
+pub(crate) fn generate_bitmaps_from_eq_predicates(
+    query_predicates: &InputFile,
+) -> anyhow::Result<Vec<BitSet>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(query_predicates.to_str().unwrap())
+        .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", query_predicates.display()))?;
+
+    BufReader::new(file)
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let line = line.map_err(|e| anyhow::anyhow!("line {i}: {e}"))?;
+            Ok(extract_eq_ids_from_line(&line))
+        })
+        .collect()
+}
+
+/// Scan a raw JSONL line for all `"$eq":"N"` occurrences and insert N into a BitSet.
+/// Does not parse the full JSON — just finds the literal `"$eq"` key and reads the
+/// numeric string that follows, which is safe given the known predicate schema.
+fn extract_eq_ids_from_line(line: &str) -> BitSet {
+    let mut bitset = BitSet::new();
+    // Match both `"$eq":"N"` (no space) and `"$eq": "N"` (space after colon).
+    let needle = "\"$eq\":";
+    let bytes = line.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let nlen = needle_bytes.len();
+
+    let mut pos = 0;
+    while pos + nlen < bytes.len() {
+        // Find next occurrence of `"$eq":"`
+        if bytes[pos..pos + nlen] == *needle_bytes {
+            pos += nlen;
+            // Skip optional whitespace between `:` and `"`
+            while pos < bytes.len() && bytes[pos] == b' ' {
+                pos += 1;
+            }
+            // Expect opening `"`
+            if pos >= bytes.len() || bytes[pos] != b'"' {
+                continue;
+            }
+            pos += 1;
+            // Collect digits until closing `"`
+            let start = pos;
+            while pos < bytes.len() && bytes[pos] != b'"' {
+                pos += 1;
+            }
+            if let Ok(s) = std::str::from_utf8(&bytes[start..pos]) {
+                if let Ok(id) = s.parse::<usize>() {
+                    bitset.insert(id);
+                }
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    bitset
+}
+
 pub(crate) fn setup_filter_strategies<I, S>(
     beta: f32,
     bit_maps: I,

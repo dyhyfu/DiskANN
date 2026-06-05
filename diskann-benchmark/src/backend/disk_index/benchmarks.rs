@@ -23,9 +23,11 @@ use half::f16;
 use crate::{
     backend::disk_index::{
         build::{build_disk_index, DiskBuildStats},
-        search::{search_disk_index, DiskSearchStats},
+        search::{search_disk_index, search_disk_index_with_filter, DiskSearchStats},
     },
-    inputs::disk::{DiskIndexLoad, DiskIndexOperation, DiskIndexSource},
+    inputs::disk::{
+        DiskFilterIndexOperation, DiskIndexLoad, DiskIndexOperation, DiskIndexSource,
+    },
 };
 
 /// Disk Index
@@ -119,6 +121,89 @@ where
     }
 }
 
+/// Disk filter index benchmark (in-beam label filtering: BetaFilter / AdaptiveLGreedy / Multihop).
+struct DiskFilterIndex<T> {
+    _vector_type: std::marker::PhantomData<T>,
+}
+
+impl<T> DiskFilterIndex<T> {
+    fn new() -> Self {
+        Self { _vector_type: std::marker::PhantomData }
+    }
+}
+
+impl<T> Benchmark for DiskFilterIndex<T>
+where
+    T: VectorRepr + AsDataType,
+{
+    type Input = DiskFilterIndexOperation;
+    type Output = DiskIndexStats;
+
+    fn try_match(&self, input: &DiskFilterIndexOperation) -> Result<MatchScore, FailureScore> {
+        let data_type = match &input.source {
+            DiskIndexSource::Load(load) => load.data_type,
+            DiskIndexSource::Build(build) => build.data_type,
+        };
+        crate::utils::match_data_type::<T>(data_type)
+    }
+
+    fn description(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        input: Option<&DiskFilterIndexOperation>,
+    ) -> std::fmt::Result {
+        match input {
+            Some(arg) => {
+                let desc = match &arg.source {
+                    DiskIndexSource::Load(load) => T::describe(load.data_type),
+                    DiskIndexSource::Build(build) => T::describe(build.data_type),
+                };
+                write!(f, "{}", desc)
+            }
+            None => write!(f, "{}", T::DATA_TYPE),
+        }
+    }
+
+    fn run(
+        &self,
+        input: &DiskFilterIndexOperation,
+        _checkpoint: Checkpoint<'_>,
+        mut output: &mut dyn Output,
+    ) -> anyhow::Result<DiskIndexStats> {
+        writeln!(output, "{}", input.source)?;
+
+        let (build_stats, index_load) = match &input.source {
+            DiskIndexSource::Load(load) => Ok((None, (*load).clone())),
+            DiskIndexSource::Build(build) => build_disk_index::<T, _>(&FileStorageProvider, build)
+                .map(|stats| {
+                    (
+                        Some(stats),
+                        DiskIndexLoad {
+                            data_type: build.data_type,
+                            load_path: build.save_path.clone(),
+                        },
+                    )
+                }),
+        }?;
+        if let Some(build_stats) = &build_stats {
+            writeln!(output, "{}", build_stats)?;
+        }
+
+        writeln!(output, "{}", input.search_phase)?;
+        let search_stats = search_disk_index_with_filter::<T, _>(
+            &index_load,
+            &input.search_phase,
+            &FileStorageProvider,
+        )?;
+        writeln!(output, "{}", search_stats)?;
+
+        Ok(DiskIndexStats {
+            build: build_stats,
+            search: search_stats,
+        })
+    }
+}
+
 ////////////////////////////
 // Benchmark Registration //
 ////////////////////////////
@@ -128,6 +213,8 @@ pub(super) fn register_benchmarks(registry: &mut Registry) -> anyhow::Result<()>
     registry.register_regression("disk-index-f16", DiskIndex::<f16>::new())?;
     registry.register_regression("disk-index-u8", DiskIndex::<u8>::new())?;
     registry.register_regression("disk-index-i8", DiskIndex::<i8>::new())?;
+    registry.register("disk-index-filter-f32", DiskFilterIndex::<f32>::new())?;
+    registry.register("disk-index-filter-f16", DiskFilterIndex::<f16>::new())?;
     Ok(())
 }
 

@@ -22,7 +22,8 @@ use diskann::{
         glue::{
             self, DefaultPostProcessor, ExpandBeam, SearchExt, SearchPostProcess, SearchStrategy,
         },
-        search::Knn,
+        index::QueryLabelProvider,
+        search::{AdaptiveLGreedySearch, Knn, MultihopSearch},
         search_output_buffer, AdjacencyList, DiskANNIndex,
     },
     neighbor::{Neighbor, NeighborPriorityQueue},
@@ -33,6 +34,7 @@ use diskann::{
     utils::{IntoUsize, VectorRepr},
     ANNError, ANNResult,
 };
+use diskann_providers::model::graph::provider::layers::BetaFilter;
 use diskann_providers::storage::StorageReadProvider;
 use diskann_providers::{
     model::{compute_pq_distance, compute_pq_distance_for_pq_coordinates},
@@ -1086,6 +1088,148 @@ where
             query_statistics: query_stats.clone(),
         })
     }
+
+    /// Perform a filtered search using a per-query label provider.
+    ///
+    /// Supports three in-beam filter strategies:
+    /// - [`DiskFilterSearchType::BetaFilter`]: boosts matching node distances by `beta` during
+    ///   graph traversal so they rank higher in the search frontier.
+    /// - [`DiskFilterSearchType::AdaptiveLGreedy`]: all nodes navigate, adaptive L expansion
+    ///   based on filter selectivity.
+    /// - [`DiskFilterSearchType::Multihop`]: two-hop expansion through unmatched nodes to reach
+    ///   matching neighbors.
+    pub fn search_with_label_filter(
+        &self,
+        query: &[Data::VectorDataType],
+        return_list_size: u32,
+        search_list_size: u32,
+        beam_width: Option<usize>,
+        label_provider: Arc<dyn QueryLabelProvider<u32>>,
+        filter_type: DiskFilterSearchType,
+    ) -> ANNResult<SearchResult<Data::AssociatedDataType>> {
+        let mut query_stats = QueryStatistics::default();
+        let mut indices = vec![0u32; return_list_size as usize];
+        let mut distances = vec![0f32; return_list_size as usize];
+        let mut associated_data =
+            vec![Data::AssociatedDataType::default(); return_list_size as usize];
+
+        let mut result_output_buffer = search_output_buffer::IdDistanceAssociatedData::new(
+            &mut indices[..return_list_size as usize],
+            &mut distances[..return_list_size as usize],
+            &mut associated_data[..return_list_size as usize],
+        );
+
+        let k = return_list_size as usize;
+        let l = search_list_size as usize;
+        let knn = Knn::new(k, l, beam_width)?;
+
+        // Closure-based filter for RerankAndFilter (post-processing step).
+        let lp = label_provider.clone();
+        let filter_fn: &(dyn Fn(&u32) -> bool + Send + Sync) =
+            &move |id: &u32| lp.is_match(*id);
+
+        let timer = Instant::now();
+
+        // Each branch creates its own strategy so io_tracker remains accessible after search.
+        let (stats, io_time_us, io_count, pq_preprocess_us) = match filter_type {
+            DiskFilterSearchType::BetaFilter { beta } => {
+                // strategy is moved into BetaFilter, so we read IO stats from a dedicated
+                // IOTracker that lives on the stack here.
+                let strategy = self.search_strategy(query, filter_fn);
+                let beta_strategy =
+                    BetaFilter::<_, u32>::new(strategy, label_provider, beta);
+                let s = self.runtime.block_on(self.index.search(
+                    knn,
+                    &beta_strategy,
+                    &DefaultContext,
+                    query,
+                    &mut result_output_buffer,
+                ))?;
+                // strategy was moved into beta_strategy; IO stats unavailable without a getter.
+                // We report 0 for IO sub-metrics; total_execution_time_us is still accurate.
+                (s, 0u64, 0u32, 0u64)
+            }
+            DiskFilterSearchType::AdaptiveLGreedy => {
+                let strategy = self.search_strategy(query, filter_fn);
+                let adaptive_search = AdaptiveLGreedySearch::new(knn, label_provider.as_ref());
+                let processor = strategy.default_post_processor();
+                let s = self.runtime.block_on(self.index.search_with(
+                    adaptive_search,
+                    &strategy,
+                    processor,
+                    &DefaultContext,
+                    query,
+                    &mut result_output_buffer,
+                ))?;
+                let io_t = IOTracker::time(&strategy.io_tracker.io_time_us);
+                let io_c = strategy.io_tracker.io_count() as u32;
+                let pq_t = IOTracker::time(&strategy.io_tracker.preprocess_time_us);
+                (s, io_t, io_c, pq_t)
+            }
+            DiskFilterSearchType::Multihop => {
+                let strategy = self.search_strategy(query, filter_fn);
+                let multihop_search = MultihopSearch::new(knn, label_provider.as_ref());
+                let processor = strategy.default_post_processor();
+                let s = self.runtime.block_on(self.index.search_with(
+                    multihop_search,
+                    &strategy,
+                    processor,
+                    &DefaultContext,
+                    query,
+                    &mut result_output_buffer,
+                ))?;
+                let io_t = IOTracker::time(&strategy.io_tracker.io_time_us);
+                let io_c = strategy.io_tracker.io_count() as u32;
+                let pq_t = IOTracker::time(&strategy.io_tracker.preprocess_time_us);
+                (s, io_t, io_c, pq_t)
+            }
+        };
+
+        query_stats.total_comparisons = stats.cmps;
+        query_stats.search_hops = stats.hops;
+        query_stats.total_execution_time_us = timer.elapsed().as_micros();
+        query_stats.io_time_us = io_time_us as u128;
+        query_stats.total_io_operations = io_count;
+        query_stats.total_vertices_loaded = io_count;
+        query_stats.query_pq_preprocess_time_us = pq_preprocess_us as u128;
+        query_stats.cpu_time_us = query_stats.total_execution_time_us
+            - query_stats.io_time_us
+            - query_stats.query_pq_preprocess_time_us;
+
+        let result_count = stats.result_count as usize;
+        let mut search_result = SearchResult {
+            results: Vec::with_capacity(result_count),
+            stats: SearchResultStats {
+                cmps: query_stats.total_comparisons,
+                result_count: stats.result_count,
+                query_statistics: query_stats,
+            },
+        };
+        for ((vertex_id, distance), associated_data) in indices[..result_count]
+            .iter()
+            .copied()
+            .zip(distances[..result_count].iter().copied())
+            .zip(associated_data[..result_count].iter().copied())
+        {
+            search_result.results.push(SearchResultItem {
+                vertex_id,
+                distance,
+                data: associated_data,
+            });
+        }
+        Ok(search_result)
+    }
+}
+
+/// Which in-beam filter strategy to use during disk search.
+#[derive(Debug, Clone, Copy)]
+pub enum DiskFilterSearchType {
+    /// Boost matching node distances by `beta` (< 1.0) during beam traversal.
+    BetaFilter { beta: f32 },
+    /// All nodes navigate; search list expands adaptively based on filter selectivity.
+    AdaptiveLGreedy,
+    /// Two-hop expansion through unmatched nodes to reach matching neighbors.
+    Multihop,
 }
 
 /// Helper function to ensure vertices are loaded and processed.

@@ -42,6 +42,7 @@ use crate::{
     provider::DataProvider,
 };
 
+mod greedy_filter_search;
 mod knn_search;
 pub(crate) mod multihop_search;
 mod range_search;
@@ -110,6 +111,7 @@ where
         OB: graph::search_output_buffer::SearchOutputBuffer<O> + Send + ?Sized;
 }
 
+pub use greedy_filter_search::AdaptiveLGreedySearch;
 pub use knn_search::{Knn, KnnSearchError, RecordedKnn};
 pub use multihop_search::MultihopSearch;
 pub use range_search::{Range, RangeSearchError};

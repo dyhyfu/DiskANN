@@ -307,6 +307,31 @@ macro_rules! write_field {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct AdaptiveLSearchPhase {
+    pub(crate) queries: InputFile,
+    pub(crate) query_predicates: InputFile,
+    pub(crate) groundtruth: InputFile,
+    pub(crate) reps: NonZeroUsize,
+    pub(crate) data_labels: InputFile,
+    pub(crate) num_threads: Vec<NonZeroUsize>,
+    pub(crate) runs: Vec<GraphSearch>,
+}
+
+impl AdaptiveLSearchPhase {
+    pub(crate) fn validate(&mut self, checker: &mut Checker) -> Result<(), anyhow::Error> {
+        self.queries.resolve(checker)?;
+        self.query_predicates.resolve(checker)?;
+        self.data_labels.resolve(checker)?;
+        self.groundtruth.resolve(checker)?;
+        for (i, run) in self.runs.iter_mut().enumerate() {
+            run.validate(checker)
+                .with_context(|| format!("search run {}", i))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "search-type", rename_all = "kebab-case")]
 pub(crate) enum SearchPhase {
@@ -314,6 +339,7 @@ pub(crate) enum SearchPhase {
     Range(RangeSearchPhase),
     TopkBetaFilter(BetaSearchPhase),
     TopkMultihopFilter(MultiHopSearchPhase),
+    TopkAdaptiveLFilter(AdaptiveLSearchPhase),
 }
 
 #[derive(Debug, Error)]
@@ -340,6 +366,7 @@ impl SearchPhase {
             Self::Range(_) => SearchPhaseKind::Range,
             Self::TopkBetaFilter(_) => SearchPhaseKind::TopkBetaFilter,
             Self::TopkMultihopFilter(_) => SearchPhaseKind::TopkMultihopFilter,
+            Self::TopkAdaptiveLFilter(_) => SearchPhaseKind::TopkAdaptiveLFilter,
         }
     }
 
@@ -384,6 +411,18 @@ impl SearchPhase {
             )),
         }
     }
+
+    pub(crate) fn as_topk_adaptive_l_filter(
+        &self,
+    ) -> Result<&AdaptiveLSearchPhase, WrongSearchPhaseKind> {
+        match self {
+            Self::TopkAdaptiveLFilter(phase) => Ok(phase),
+            _ => Err(WrongSearchPhaseKind::new(
+                SearchPhaseKind::TopkAdaptiveLFilter,
+                self.kind(),
+            )),
+        }
+    }
 }
 
 impl SearchPhase {
@@ -393,6 +432,7 @@ impl SearchPhase {
             SearchPhase::Range(phase) => phase.validate(checker),
             SearchPhase::TopkBetaFilter(phase) => phase.validate(checker),
             SearchPhase::TopkMultihopFilter(phase) => phase.validate(checker),
+            SearchPhase::TopkAdaptiveLFilter(phase) => phase.validate(checker),
         }
     }
 }
@@ -403,6 +443,7 @@ pub(crate) enum SearchPhaseKind {
     Range,
     TopkBetaFilter,
     TopkMultihopFilter,
+    TopkAdaptiveLFilter,
 }
 
 impl SearchPhaseKind {
@@ -412,6 +453,7 @@ impl SearchPhaseKind {
             Self::Range => "range",
             Self::TopkBetaFilter => "topk-beta-filter",
             Self::TopkMultihopFilter => "topk-multihop-filter",
+            Self::TopkAdaptiveLFilter => "topk-adaptive-l-filter",
         }
     }
 }

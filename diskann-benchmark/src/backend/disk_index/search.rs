@@ -30,10 +30,15 @@ use diskann_tools::utils::{search_index_utils, KRecallAtN};
 use diskann_utils::views::Matrix;
 use serde::{Deserialize, Serialize};
 
+use bit_set::BitSet;
+use diskann::graph::index::QueryLabelProvider;
+use diskann_disk::search::provider::disk_provider::DiskFilterSearchType;
+use std::sync::Arc;
+
 use crate::{
     backend::disk_index::json_spancollector::JsonSpanCollector,
-    inputs::disk::{DiskIndexLoad, DiskSearchPhase},
-    utils::{datafiles, SimilarityMeasure},
+    inputs::disk::{DiskFilterIndexOperation, DiskFilterSearchPhase, DiskFilterType, DiskIndexLoad, DiskSearchPhase},
+    utils::{datafiles, SimilarityMeasure, filters},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -346,6 +351,191 @@ where
         is_flat_search: search_params.is_flat_search,
         distance: search_params.distance,
         uses_vector_filters: search_params.vector_filters_file.is_some(),
+        num_nodes_to_cache: search_params.num_nodes_to_cache,
+        search_results_per_l,
+        span_metrics,
+    })
+}
+
+pub(super) fn search_disk_index_with_filter<T, StorageType>(
+    index_load: &DiskIndexLoad,
+    search_params: &DiskFilterSearchPhase,
+    storage_provider: &StorageType,
+) -> anyhow::Result<DiskSearchStats>
+where
+    T: VectorRepr,
+    StorageType: StorageReadProvider,
+{
+    let previous_tracer_provider = global::tracer_provider();
+    let span_collector = {
+        let collector = JsonSpanCollector::new();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(collector.clone())
+            .build();
+        global::set_tracer_provider(provider.clone());
+        Some((collector, provider))
+    };
+
+    let mut logger = PerfLogger::new("search_disk_index_with_filter", true);
+
+    let queries: Matrix<T> = datafiles::load_dataset(datafiles::BinFile(&search_params.queries))?;
+    let num_queries = queries.nrows();
+
+    // Build per-query label providers directly from the $eq vector_id predicates —
+    // no inverted index construction needed since predicates only reference integer vector IDs.
+    let bitmaps: Vec<BitSet> =
+        filters::generate_bitmaps_from_eq_predicates(&search_params.query_predicates)?;
+    if bitmaps.len() != num_queries {
+        anyhow::bail!("number of query predicates ({}) != number of queries ({})", bitmaps.len(), num_queries);
+    }
+    let label_providers: Vec<Arc<dyn QueryLabelProvider<u32>>> =
+        bitmaps.into_iter().map(filters::as_query_label_provider).collect();
+
+    let filter_type: DiskFilterSearchType = match search_params.filter_type {
+        DiskFilterType::BetaFilter { beta } => DiskFilterSearchType::BetaFilter { beta },
+        DiskFilterType::AdaptiveLGreedy => DiskFilterSearchType::AdaptiveLGreedy,
+        DiskFilterType::Multihop => DiskFilterSearchType::Multihop,
+    };
+
+    let gt_context = prepare_ground_truth_context(
+        true, // always uses label filters
+        &search_params.groundtruth,
+        search_params.recall_at,
+        storage_provider,
+    )?;
+
+    let pivot_path = get_pq_pivot_file(&index_load.load_path);
+    let pq_data_path = get_compressed_pq_file(&index_load.load_path);
+    let disk_index_path = get_disk_index_file(&index_load.load_path);
+
+    let index_reader = DiskIndexReader::<T>::new(pivot_path, pq_data_path, &FileStorageProvider)?;
+
+    let caching_strategy = if let Some(num_nodes) = search_params.num_nodes_to_cache {
+        CachingStrategy::StaticCacheWithBfsNodes(num_nodes)
+    } else {
+        CachingStrategy::None
+    };
+
+    let reader_factory = AlignedFileReaderFactory::new(disk_index_path);
+    let vertex_provider_factory = DiskVertexProviderFactory::new(reader_factory, caching_strategy)?;
+
+    let searcher = &DiskIndexSearcher::<AdHoc<T>, _>::new(
+        search_params.num_threads,
+        search_params.search_io_limit.unwrap_or(usize::MAX),
+        &index_reader,
+        vertex_provider_factory,
+        search_params.distance.into(),
+        None,
+    )?;
+
+    logger.log_checkpoint("index_loaded");
+
+    let pool = create_thread_pool(search_params.num_threads)?;
+    let mut search_results_per_l = Vec::with_capacity(search_params.search_list.len());
+    let has_any_search_failed = AtomicBool::new(false);
+
+    for &l in search_params.search_list.iter() {
+        let mut statistics_vec: Vec<QueryStatistics> = vec![QueryStatistics::default(); num_queries];
+        let mut result_counts: Vec<u32> = vec![0; num_queries];
+        let mut result_ids: Vec<u32> =
+            vec![0; (search_params.recall_at as usize) * num_queries];
+        let mut result_dists: Vec<f32> =
+            vec![0.0; (search_params.recall_at as usize) * num_queries];
+
+        let start = Instant::now();
+
+        let mut l_span = {
+            let tracer = global::tracer("");
+            let span_name = format!("search-with-L={}-bw={}", l, search_params.beam_width);
+            tracer.start(span_name)
+        };
+
+        let zipped = queries
+            .par_row_iter()
+            .zip(label_providers.par_iter())
+            .zip(result_ids.par_chunks_mut(search_params.recall_at as usize))
+            .zip(result_dists.par_chunks_mut(search_params.recall_at as usize))
+            .zip(statistics_vec.par_iter_mut())
+            .zip(result_counts.par_iter_mut());
+
+        zipped.for_each_in_pool(
+            pool.as_ref(),
+            |(((((q, lp), id_chunk), dist_chunk), stats), rc)| {
+                match searcher.search_with_label_filter(
+                    q,
+                    search_params.recall_at,
+                    l,
+                    Some(search_params.beam_width),
+                    lp.clone(),
+                    filter_type,
+                ) {
+                    Ok(search_result) => {
+                        *stats = search_result.stats.query_statistics;
+                        *rc = search_result.results.len() as u32;
+                        let actual = search_result
+                            .results
+                            .len()
+                            .min(search_params.recall_at as usize);
+                        for (i, item) in search_result.results.iter().take(actual).enumerate() {
+                            id_chunk[i] = item.vertex_id;
+                            dist_chunk[i] = item.distance;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Filter search failed for query: {:?}", e);
+                        *rc = 0;
+                        id_chunk.fill(0);
+                        dist_chunk.fill(0.0);
+                        has_any_search_failed.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            },
+        );
+
+        let total_time = start.elapsed();
+
+        if has_any_search_failed.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("One or more filter searches failed.");
+        }
+
+        let search_result = DiskSearchResult::new(
+            &statistics_vec,
+            &result_ids,
+            &result_counts,
+            l,
+            total_time.as_secs_f32(),
+            num_queries,
+            &gt_context,
+        )?;
+
+        l_span.end();
+        search_results_per_l.push(search_result);
+    }
+
+    logger.log_checkpoint("search_completed");
+
+    let span_metrics = if let Some((collector, provider)) = span_collector {
+        provider.shutdown()?;
+        collector.to_hierarchical_json()
+    } else {
+        serde_json::json!({ "span_data": [] })
+    };
+
+    global::set_tracer_provider(previous_tracer_provider);
+
+    let filter_desc = match search_params.filter_type {
+        DiskFilterType::BetaFilter { beta } => format!("beta-filter(beta={beta})"),
+        DiskFilterType::AdaptiveLGreedy => "adaptive-l-greedy".to_string(),
+        DiskFilterType::Multihop => "multihop".to_string(),
+    };
+
+    Ok(DiskSearchStats {
+        num_threads: search_params.num_threads,
+        beam_width: search_params.beam_width,
+        recall_at: search_params.recall_at,
+        is_flat_search: false,
+        distance: search_params.distance,
+        uses_vector_filters: true,
         num_nodes_to_cache: search_params.num_nodes_to_cache,
         search_results_per_l,
         span_metrics,

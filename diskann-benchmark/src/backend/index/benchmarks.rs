@@ -49,7 +49,7 @@ use crate::{
     utils::{
         self,
         datafiles::{self},
-        filters::{generate_bitmaps, setup_filter_strategies},
+        filters::{generate_bitmaps_from_eq_predicates, setup_filter_strategies},
     },
 };
 
@@ -76,12 +76,16 @@ pub(super) fn register_benchmarks(registry: &mut Registry) -> anyhow::Result<()>
             .search(plugins::Topk)
             .search(plugins::Range)
             .search(plugins::TopkBetaFilter)
-            .search(plugins::TopkMultihopFilter),
+            .search(plugins::TopkMultihopFilter)
+            .search(plugins::TopkAdaptiveLFilter),
     )?;
 
     registry.register(
         "graph-index-full-precision-f16",
-        FullPrecision::<f16>::new().search(plugins::Topk),
+        FullPrecision::<f16>::new()
+            .search(plugins::Topk)
+            .search(plugins::TopkBetaFilter)
+            .search(plugins::TopkAdaptiveLFilter),
     )?;
     registry.register(
         "graph-index-full-precision-u8",
@@ -559,7 +563,7 @@ where
         let groundtruth =
             datafiles::load_range_groundtruth(datafiles::BinFile(&beta_filter.groundtruth))?;
 
-        let bit_maps = generate_bitmaps(&beta_filter.query_predicates, &beta_filter.data_labels)?;
+        let bit_maps = generate_bitmaps_from_eq_predicates(&beta_filter.query_predicates)?;
 
         let search_strategies = setup_filter_strategies(
             beta_filter.beta,
@@ -621,7 +625,7 @@ where
         let steps =
             search::knn::SearchSteps::new(multihop.reps, &multihop.num_threads, &multihop.runs);
 
-        let bit_maps = generate_bitmaps(&multihop.query_predicates, &multihop.data_labels)?;
+        let bit_maps = generate_bitmaps_from_eq_predicates(&multihop.query_predicates)?;
 
         let multihop = benchmark_core::search::graph::MultiHop::new(
             index,
@@ -634,6 +638,58 @@ where
         )?;
 
         let result = search::knn::run(&multihop, &groundtruth, steps)?;
+        Ok(AggregatedSearchResults::Topk(result))
+    }
+}
+
+//---------------------//
+// AdaptiveLFilter     //
+//---------------------//
+
+impl<DP, S> search::Plugin<DP, SearchPhase, Strategy<S>> for plugins::TopkAdaptiveLFilter
+where
+    DP: DataProvider<Context: Default, InternalId = u32, ExternalId = u32> + QueryType,
+    S: for<'a> glue::DefaultSearchStrategy<DP, &'a [DP::Element]> + Clone + AsyncFriendly,
+{
+    fn is_match(&self, phase: &SearchPhase) -> bool {
+        Self::kind() == phase.kind()
+    }
+
+    fn kind(&self) -> &'static str {
+        Self::kind().as_str()
+    }
+
+    fn run(
+        &self,
+        index: Arc<DiskANNIndex<DP>>,
+        phase: &SearchPhase,
+        strategy: &Strategy<S>,
+    ) -> anyhow::Result<AggregatedSearchResults> {
+        let adaptive = phase.as_topk_adaptive_l_filter()?;
+
+        let queries: Arc<Matrix<DP::Element>> = Arc::new(datafiles::load_dataset(
+            datafiles::BinFile(&adaptive.queries),
+        )?);
+
+        let groundtruth =
+            datafiles::load_range_groundtruth(datafiles::BinFile(&adaptive.groundtruth))?;
+
+        let steps =
+            search::knn::SearchSteps::new(adaptive.reps, &adaptive.num_threads, &adaptive.runs);
+
+        let bit_maps = generate_bitmaps_from_eq_predicates(&adaptive.query_predicates)?;
+
+        let adaptive_l = benchmark_core::search::graph::AdaptiveL::new(
+            index,
+            queries,
+            benchmark_core::search::graph::Strategy::broadcast(strategy.inner()),
+            bit_maps
+                .into_iter()
+                .map(utils::filters::as_query_label_provider)
+                .collect(),
+        )?;
+
+        let result = search::knn::run(&adaptive_l, &groundtruth, steps)?;
         Ok(AggregatedSearchResults::Topk(result))
     }
 }

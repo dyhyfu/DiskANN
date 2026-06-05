@@ -3,12 +3,14 @@
  * Licensed under the MIT license.
  */
 
+pub mod adaptive_l;
 pub mod knn;
 pub mod multihop;
 pub mod range;
 
 pub mod strategy;
 
+pub use adaptive_l::AdaptiveL;
 pub use knn::KNN;
 pub use multihop::MultiHop;
 pub use range::Range;

@@ -22,10 +22,18 @@ use crate::{
 //////////////
 
 as_input!(DiskIndexOperation);
+as_input!(DiskFilterIndexOperation);
 
 ///////////
 // Input //
 ///////////
+
+/// Top-level input for a disk filter benchmark run (load existing index + filter search).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct DiskFilterIndexOperation {
+    pub(crate) source: DiskIndexSource,
+    pub(crate) search_phase: DiskFilterSearchPhase,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct DiskIndexOperation {
@@ -60,6 +68,38 @@ pub(crate) struct DiskIndexBuild {
     #[cfg(feature = "disk-index")]
     pub(crate) quantization_type: QuantizationType,
     pub(crate) save_path: String,
+}
+
+/// Which in-beam filter algorithm to use for disk filter search.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
+#[serde(tag = "type")]
+pub(crate) enum DiskFilterType {
+    /// Boost matching node distances by `beta` (< 1.0) during beam traversal.
+    BetaFilter { beta: f32 },
+    /// Adaptive-L greedy: all nodes navigate, search list expands based on selectivity.
+    AdaptiveLGreedy,
+    /// Two-hop expansion through unmatched nodes.
+    Multihop,
+}
+
+/// Search phase configuration for in-beam label-filtered disk search.
+///
+/// Loads per-query predicates from `query_predicates` and data-point labels from
+/// `data_labels`, then runs the chosen `filter_type` algorithm.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct DiskFilterSearchPhase {
+    pub(crate) queries: InputFile,
+    pub(crate) groundtruth: InputFile,
+    pub(crate) data_labels: InputFile,
+    pub(crate) query_predicates: InputFile,
+    pub(crate) num_threads: usize,
+    pub(crate) beam_width: usize,
+    pub(crate) search_list: Vec<u32>,
+    pub(crate) recall_at: u32,
+    pub(crate) distance: SimilarityMeasure,
+    pub(crate) filter_type: DiskFilterType,
+    pub(crate) num_nodes_to_cache: Option<usize>,
+    pub(crate) search_io_limit: Option<usize>,
 }
 
 /// Search phase configuration
@@ -164,6 +204,51 @@ impl DiskIndexBuild {
             }
         };
 
+        Ok(())
+    }
+}
+
+impl DiskFilterIndexOperation {
+    pub(crate) const fn tag() -> &'static str {
+        "disk-index-filter"
+    }
+
+    pub(crate) fn validate(&mut self, checker: &mut Checker) -> Result<(), anyhow::Error> {
+        match &mut self.source {
+            DiskIndexSource::Load(load) => load.validate(checker)?,
+            DiskIndexSource::Build(build) => build.validate(checker)?,
+        }
+        self.search_phase.validate(checker)?;
+        Ok(())
+    }
+}
+
+impl DiskFilterSearchPhase {
+    pub(crate) fn validate(&mut self, checker: &mut Checker) -> anyhow::Result<()> {
+        self.queries.resolve(checker).context("invalid queries file")?;
+        self.groundtruth.resolve(checker).context("invalid groundtruth file")?;
+        self.data_labels.resolve(checker).context("invalid data_labels file")?;
+        self.query_predicates.resolve(checker).context("invalid query_predicates file")?;
+        if self.search_list.is_empty() {
+            anyhow::bail!("search_list must have at least one value");
+        }
+        if self.search_list.iter().any(|&l| l == 0 || l < self.recall_at) {
+            anyhow::bail!("search_list values must be positive and >= recall_at");
+        }
+        if self.beam_width == 0 {
+            anyhow::bail!("beam_width must be positive");
+        }
+        if self.recall_at == 0 {
+            anyhow::bail!("recall_at must be positive");
+        }
+        if self.num_threads == 0 {
+            anyhow::bail!("num_threads must be positive");
+        }
+        if let DiskFilterType::BetaFilter { beta } = self.filter_type {
+            if beta <= 0.0 || beta > 1.0 {
+                anyhow::bail!("beta must be in (0, 1]");
+            }
+        }
         Ok(())
     }
 }
@@ -381,5 +466,77 @@ impl fmt::Display for DiskSearchPhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Disk Index Search Phase")?;
         self.summarize_fields(f)
+    }
+}
+
+impl Example for DiskFilterIndexOperation {
+    fn example() -> Self {
+        let load = DiskIndexLoad {
+            data_type: DataType::Float32,
+            load_path: "sample_index_l50_r32".to_string(),
+        };
+        let search = DiskFilterSearchPhase {
+            queries: InputFile::new("path/to/queries.fbin"),
+            groundtruth: InputFile::new("path/to/groundtruth_filtered.bin"),
+            data_labels: InputFile::new("path/to/data.label.jsonl"),
+            query_predicates: InputFile::new("path/to/query.label.jsonl"),
+            search_list: vec![1000, 2000, 3000],
+            beam_width: 4,
+            recall_at: 1000,
+            num_threads: 12,
+            distance: SimilarityMeasure::SquaredL2,
+            filter_type: DiskFilterType::BetaFilter { beta: 0.5 },
+            num_nodes_to_cache: None,
+            search_io_limit: None,
+        };
+        Self {
+            source: DiskIndexSource::Load(load),
+            search_phase: search,
+        }
+    }
+}
+
+impl fmt::Display for DiskFilterSearchPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Disk Filter Search Phase")?;
+        write_field!(f, "Queries", self.queries.display())?;
+        write_field!(f, "Groundtruth", self.groundtruth.display())?;
+        write_field!(f, "Data Labels", self.data_labels.display())?;
+        write_field!(f, "Query Predicates", self.query_predicates.display())?;
+        {
+            let mut first = true;
+            write!(f, "        Search List:")?;
+            for v in &self.search_list {
+                if !first { write!(f, ",")?; }
+                write!(f, "{}", v)?;
+                first = false;
+            }
+            writeln!(f)?;
+        }
+        write_field!(f, "Beam Width", self.beam_width)?;
+        write_field!(f, "Recall@", self.recall_at)?;
+        write_field!(f, "Threads", self.num_threads)?;
+        write_field!(f, "Distance", self.distance)?;
+        match self.filter_type {
+            DiskFilterType::BetaFilter { beta } => write_field!(f, "Filter Type", format!("BetaFilter (beta={beta})"))?,
+            DiskFilterType::AdaptiveLGreedy => write_field!(f, "Filter Type", "AdaptiveLGreedy")?,
+            DiskFilterType::Multihop => write_field!(f, "Filter Type", "Multihop")?,
+        }
+        match self.num_nodes_to_cache {
+            Some(n) => write_field!(f, "Num Nodes to Cache", n)?,
+            None => write_field!(f, "Num Nodes to Cache", "none")?,
+        }
+        match self.search_io_limit {
+            Some(lim) => write_field!(f, "Search IO Limit", lim)?,
+            None => write_field!(f, "Search IO Limit", "none")?,
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for DiskFilterIndexOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(f)?;
+        self.search_phase.fmt(f)
     }
 }

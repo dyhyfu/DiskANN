@@ -1,0 +1,56 @@
+[
+  {
+    "input": {
+      "content": {
+        "search_phase": {
+          "data_labels": "enron_filter_benchmark2/output\\data.label.jsonl",
+          "groundtruth": "enron_filter_benchmark2/output\\random_1000_groundtruth_filtered.bin",
+          "num_threads": [
+            12
+          ],
+          "queries": "enron_filter_benchmark2/output\\query_vector_normalized_dim_384_fp16_top_1000.bin",
+          "query_predicates": "enron_filter_benchmark2/output\\random_1000_query.label.jsonl",
+          "reps": 1,
+          "runs": [
+            {
+              "recall_k": 1000,
+              "search_l": [
+                2000
+              ],
+              "search_n": 1000
+            }
+          ],
+          "search-type": "topk-adaptive-l-filter"
+        },
+        "source": {
+          "alpha": 1.2000000476837158,
+          "backedge_ratio": 1.0,
+          "data": "enron_filter_benchmark2/output\\normalized_dim_384_vector_fp16_1087932_vectors.bin",
+          "data_type": "float16",
+          "distance": "squared_l2",
+          "index-source": "Build",
+          "insert_retry": null,
+          "l_build": 80,
+          "max_degree": 59,
+          "multi_insert": null,
+          "num_threads": 12,
+          "save_path": "filter_benchmark2\\index_output2",
+          "start_point_strategy": "medoid"
+        }
+      },
+      "type": "graph-index-build"
+    },
+    "results": {
+      "insert_latencies": {
+        "mean": 803.6891506086778,
+        "median": 767.0,
+        "minimum": 77,
+        "p90": 1240,
+        "p99": 1722
+      },
+      "kind": "SingleInsert",
+      "total_time": 73060461,
+      "vectors_inserted": 1087932
+    }
+  }
+]
